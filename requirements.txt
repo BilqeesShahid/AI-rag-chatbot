@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+python-dotenv
+qdrant-client>=1.8.0
+openai-agents
+scikit-learn
+numpy
+requests
+pydantic
+torch>=2.2.0,<2.3.0
+sentence-transformers>=2.2.2,<2.3.0
