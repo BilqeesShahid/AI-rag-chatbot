@@ -51,17 +51,17 @@ class SkillsService:
 
     async def execute_code_validation(self, code: str) -> Dict[str, Any]:
         """
-        Execute ROS code validation skill.
+        Execute code validation skill.
         """
         return await self.agent_orchestrator.execute_agent_task(
             "code_validator",
-            "Validate this ROS code",
+            "Validate this code",
             context=code
         )
 
-    async def execute_simulation_guidance(self, query: str, context_text: str = "") -> Dict[str, Any]:
+    async def execute_guidance_assistance(self, query: str, context_text: str = "") -> Dict[str, Any]:
         """
-        Execute simulation guidance skill.
+        Execute general guidance assistance skill.
         """
         # If no context provided, retrieve relevant chunks from the RAG system
         if not context_text:
@@ -115,7 +115,7 @@ class SkillsService:
             elif skill_name == "code_validator":
                 result = await self.execute_code_validation(query)
             elif skill_name == "simulation_helper":
-                result = await self.execute_simulation_guidance(query, current_context)
+                result = await self.execute_guidance_assistance(query, current_context)
             else:
                 result = {
                     "status": "error",

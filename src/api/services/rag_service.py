@@ -115,11 +115,16 @@ def summarize_answer(query: str, chunks: List[SourceChunk], retrieval_service) -
                 if subject_frequency > 0:
                     score += subject_frequency * 5  # Higher boost for subject relevance in definition queries
 
-        # 6. Chapter-topic relevance
+        # 6. General topic relevance - boost for any matching topics between query and chunk title
         chunk_title_lower = chunk.section_title.lower()
-        if any(topic in query_lower for topic in ['ros2', 'simulation', 'isaac', 'vla']) and \
-           any(topic in chunk_title_lower for topic in ['ros2', 'simulation', 'isaac', 'vla']):
-            score += 7  # Boost for topic-chapter alignment
+        # Extract meaningful words from query for topic matching
+        query_words = set(word for word in query_lower.split() if len(word) > 3 and word not in ['the', 'and', 'for', 'with', 'are', 'you', 'what', 'how', 'why'])
+        chunk_title_words = set(word for word in chunk_title_lower.split() if len(word) > 3 and word not in ['the', 'and', 'for', 'with', 'are', 'you', 'what', 'how', 'why'])
+
+        # Boost for topic alignment between query and chunk title
+        common_topics = query_words.intersection(chunk_title_words)
+        if common_topics:
+            score += len(common_topics) * 3  # Boost for each matching topic word
 
         scored_results.append((chunk, content, score))
 
@@ -404,22 +409,36 @@ class RAGService:
                 content_lower = content.lower()
                 score = 0
 
-                # Look for the exact definition pattern of ROS2 or similar
                 # Check if this looks like a definition of the subject being asked about
                 if 'what is ' in query_lower:
                     subject = query_lower.split('what is ')[1].strip().split()[0] if len(query_lower.split('what is ')) > 1 else ""
-                    if subject:
+                    if subject and len(subject) > 2:  # Only consider meaningful subjects
                         # Look for exact definition patterns with the subject
-                        # e.g., "ROS2 is a flexible framework" or "X is Y" patterns
+                        # e.g., "X is a ..." or "X is Y" patterns
                         subject_pattern = f"{subject.lower()} is "
                         if subject_pattern in content_lower:
                             score += 50  # High score for exact subject definition pattern
 
-                        # Look for the specific pattern from the docs: "X (Full Name) is a ..."
+                        # Look for the general pattern: "X (Description) is a ..."
                         import re
-                        # Check for pattern like "ROS2 (Robot Operating System 2) is a ..."
+                        # Check for pattern like "X (Description) is a ..."
                         if re.search(rf"{re.escape(subject.lower())} \([^)]+\) is (a|an) ", content_lower):
                             score += 60  # Very high score for formal definition pattern
+
+                        # Look for definition patterns with the subject anywhere in the content
+                        if subject.lower() in content_lower:
+                            # Check for definition-like patterns containing the subject
+                            definition_patterns = [
+                                rf"\b{re.escape(subject.lower())}\b.*\bis\b.*\b(a|an|the|this)\b",
+                                rf"\b{re.escape(subject.lower())}\b.*\brefers to\b",
+                                rf"\b{re.escape(subject.lower())}\b.*\bstands for\b",
+                                rf"\b{re.escape(subject.lower())}\b.*\bmeans\b",
+                                rf"\b{re.escape(subject.lower())}\b.*\bis defined as\b"
+                            ]
+                            for pattern in definition_patterns:
+                                if re.search(pattern, content_lower):
+                                    score += 40  # High score for definition patterns with subject
+                                    break
 
                 # Boost score if content contains definition patterns
                 if any(pattern in content_lower for pattern in [' is a ', ' is an ', ' refers to ', ' means ', ' stands for ', ' defined as ', ' known as ', ' describes ', ' represents ', ' called ', ' termed ']):

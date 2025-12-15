@@ -109,19 +109,19 @@ class AgentOrchestrator:
 
     async def _code_validation_agent(self, query: str, context: str, **kwargs) -> str:
         """
-        Agent for ROS code validation.
+        Agent for code validation.
         """
         code_to_validate = context or query
 
         prompt = f"""
-        Analyze the following ROS code for correctness, best practices, and potential issues.
+        Analyze the following code for correctness, best practices, and potential issues.
         Provide feedback on:
         1. Syntax correctness
         2. Best practices adherence
         3. Potential runtime issues
         4. Suggestions for improvement
 
-        ROS Code to validate:
+        Code to validate:
         {code_to_validate}
 
         Analysis and feedback:
@@ -140,16 +140,16 @@ class AgentOrchestrator:
 
     async def _simulation_helper_agent(self, query: str, context: str, **kwargs) -> str:
         """
-        Agent for simulation guidance and verification.
+        Agent for general guidance and problem-solving assistance.
         """
-        simulation_query = context or query
+        guidance_query = context or query
 
         prompt = f"""
-        Provide guidance on the following simulation query related to robotics.
+        Provide guidance on the following query.
         Include best practices, common pitfalls, and recommendations.
 
-        Simulation query:
-        {simulation_query}
+        Query:
+        {guidance_query}
 
         Guidance and recommendations:
         """
