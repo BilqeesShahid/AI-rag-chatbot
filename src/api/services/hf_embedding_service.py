@@ -237,16 +237,13 @@ class HFEmbeddingService:
                     ]
                 )
 
-            # Search in Qdrant
-            search_response = self.qdrant_client.query_points(
+            # Search in Qdrant (using search method for compatibility with older versions)
+            search_results = self.qdrant_client.search(
                 collection_name=QDRANT_COLLECTION_NAME,
-                query=query_embedding,
+                query_vector=query_embedding,
                 limit=top_k,
                 query_filter=search_filter
             )
-
-            # Extract results from the response object
-            search_results = search_response.points
 
             # Convert results to DocumentChunk objects
             results = []

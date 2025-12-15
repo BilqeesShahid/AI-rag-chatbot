@@ -35,7 +35,15 @@ def summarize_answer(query: str, chunks: List[SourceChunk], retrieval_service) -
 
     # Comprehensive relevance scoring
     query_lower = query.lower().strip()
-    query_words = set(word for word in query_lower.split() if len(word) > 2)
+    # Clean punctuation from query words for better matching
+    import re
+    raw_words = query_lower.split()
+    cleaned_words = []
+    for word in raw_words:
+        cleaned_word = re.sub(r'[^\w\s]', '', word).strip()
+        if len(cleaned_word) > 2:  # Only add if cleaned word is still meaningful
+            cleaned_words.append(cleaned_word)
+    query_words = set(cleaned_words)
 
     # Check if it's a definition query to apply special logic
     is_definition_query = 'what is' in query_lower or 'define' in query_lower or 'meaning of' in query_lower
@@ -43,38 +51,46 @@ def summarize_answer(query: str, chunks: List[SourceChunk], retrieval_service) -
     scored_results = []
     for chunk, content in valid_contents:
         content_lower = content.lower()
-        content_words = set(content_lower.split())
+        # Clean punctuation from content words for better matching
+        import re
+        raw_content_words = content_lower.split()
+        cleaned_content_words = []
+        for word in raw_content_words:
+            cleaned_word = re.sub(r'[^\w\s]', '', word).strip()
+            if cleaned_word:  # Only add if cleaned word is not empty
+                cleaned_content_words.append(cleaned_word)
+        content_words = set(cleaned_content_words)
 
         # Calculate comprehensive relevance score
         score = 0
 
-        # 1. Term overlap with emphasis on exact matches
+        # 1. Term overlap with emphasis on exact matches - THIS IS MOST IMPORTANT
         common_words = query_words.intersection(content_words)
         if common_words:
             # Weight rare/common words differently - common words get lower weight
             for word in common_words:
-                # Boost for longer/more specific query terms
-                score += max(1, len(word) - 2)
+                # Boost for longer/more specific query terms - make this the primary factor
+                score += max(2, len(word) - 1) * 3  # Triple the weight for query term matches
 
         # 2. Phrase matching - look for exact query phrases in content
         for phrase in [query_lower] + query_lower.split():
             if len(phrase) > 3:  # Only consider meaningful phrases
                 phrase_matches = content_lower.count(phrase)
                 if phrase_matches > 0:
-                    score += phrase_matches * len(phrase)  # Longer phrases get higher weight
+                    score += phrase_matches * len(phrase) * 2  # Double weight for phrase matches
 
-        # 3. Semantic pattern matching for different query types
+        # 3. Semantic pattern matching for different query types - reduce weight
         if is_definition_query:
-            # Prioritize definition patterns for definition questions
+            # Prioritize definition patterns for definition questions but with lower weight
             definition_patterns = [' is a ', ' is an ', ' refers to ', ' means ', ' stands for ',
                                  ' defined as ', ' known as ', ' describes ', ' represents ', ' called ', ' termed ']
             for pattern in definition_patterns:
                 if pattern in content_lower:
-                    score += 20  # Strong boost for definition patterns
+                    score += 8  # Reduced boost for definition patterns
 
             # Additional boost for short, clear definitions
             if 10 <= len(content.split()) <= 100 and (' is ' in content_lower or ' are ' in content_lower):
-                score += 15
+                score += 7  # Reduced bonus for definition structure
 
         elif any(qw in query_lower for qw in ['how to', 'how do', 'steps', 'process', 'procedure']):
             # Prioritize procedural content for "how" questions
@@ -103,10 +119,13 @@ def summarize_answer(query: str, chunks: List[SourceChunk], retrieval_service) -
 
         # 5. Subject relevance - check if main subject appears multiple times
         if len(query_words) > 0:
-            # Extract main subject for "what is X" queries
+            # Extract main subject for "what is X" queries - clean punctuation
             main_subject = ""
             if 'what is ' in query_lower:
-                main_subject = query_lower.split('what is ')[1].strip().split()[0] if len(query_lower.split('what is ')) > 1 else ""
+                raw_subject = query_lower.split('what is ')[1].strip().split()[0] if len(query_lower.split('what is ')) > 1 else ""
+                # Remove punctuation and clean the subject
+                import re
+                main_subject = re.sub(r'[^\w\s]', '', raw_subject).strip()
             elif query_words:
                 main_subject = list(query_words)[0]
 
@@ -115,30 +134,32 @@ def summarize_answer(query: str, chunks: List[SourceChunk], retrieval_service) -
                 if subject_frequency > 0:
                     score += subject_frequency * 5  # Higher boost for subject relevance in definition queries
 
-        # 6. General topic relevance - boost for any matching topics between query and chunk title
+        # 6. Content relevance - boost for query terms appearing in chunk title
         chunk_title_lower = chunk.section_title.lower()
-        # Extract meaningful words from query for topic matching
-        query_words = set(word for word in query_lower.split() if len(word) > 3 and word not in ['the', 'and', 'for', 'with', 'are', 'you', 'what', 'how', 'why'])
-        chunk_title_words = set(word for word in chunk_title_lower.split() if len(word) > 3 and word not in ['the', 'and', 'for', 'with', 'are', 'you', 'what', 'how', 'why'])
+        query_terms = query_lower.split()
+        title_relevance_boost = 0
 
-        # Boost for topic alignment between query and chunk title
-        common_topics = query_words.intersection(chunk_title_words)
-        if common_topics:
-            score += len(common_topics) * 3  # Boost for each matching topic word
+        for term in query_terms:
+            if len(term) > 2:  # Only consider meaningful terms
+                if term in chunk_title_lower:
+                    title_relevance_boost += 5  # Boost for query terms in title
+        score += title_relevance_boost
 
         scored_results.append((chunk, content, score))
 
     # Sort by relevance score (highest first)
     scored_results.sort(key=lambda x: x[2], reverse=True)
 
-    # Return the most relevant content
+    # Return the most relevant content, but only if it's significantly relevant
     if scored_results:
         _, best_content, best_score = scored_results[0]
-        if best_score > 0:
+        # Only return content if it has a reasonably high score (indicating good relevance)
+        # Lower the threshold to allow more relevant content to be returned
+        if best_score > 5:  # Lowered threshold to allow more relevant matches
             return f"Based on the book content: {best_content.strip()}"
         else:
-            # If best score is 0 or negative, still return the best available content
-            return f"Based on the book content: {best_content.strip()}"
+            # If the best content isn't very relevant, indicate that we couldn't find good matches
+            return f"I couldn't find highly relevant information in the book to answer '{query}'. Please try rephrasing your question or check if the topic is covered in the book."
     else:
         # Fallback - should not reach here due to earlier check, but just in case
         _, fallback_content = valid_contents[0] if valid_contents else (None, "No relevant content found.")
@@ -336,6 +357,15 @@ class RAGService:
                     response = hf_generation_service.generate_response(query, ranked_chunks, self.retrieval_service)
                 else:
                     response = hf_generation_service.generate_response(query, source_chunks, self.retrieval_service)
+
+                # If HF generation service returns content that seems irrelevant,
+                # fall back to the local summarization which is more conservative
+                if response and ("I couldn't find" in response or "not in the book" in response or
+                                "not in the provided context" in response or
+                                len(response.strip()) < 20):
+                    # Use local summarization as fallback which is more conservative
+                    summary = summarize_answer(query, source_chunks, self.retrieval_service)
+                    return summary
                 return response
             else:
                 return f"I couldn't find any relevant information in the book to answer '{query}'. The search returned no results. Please try rephrasing your question."
