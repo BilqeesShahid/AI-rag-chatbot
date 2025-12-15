@@ -3,25 +3,37 @@ __pycache__/
 *.pyo
 *.pyd
 .Python
+
+# Virtual environments
 env/
 venv/
 .venv/
+
+# Logs & coverage
 pip-log.txt
 pip-delete-this-directory.txt
 .tox/
 .coverage
 .coverage.*
-.cache
 nosetests.xml
 coverage.xml
 *.cover
 *.log
+
+# Caches
+.cache
+
+# Git & tooling
 .git/
 .mypy_cache/
 .pytest_cache/
 .hypothesis/
+
+# OS files
 .DS_Store
 Thumbs.db
+
+# Editors
 .vscode/
 .idea/
 *.swp
@@ -29,3 +41,7 @@ Thumbs.db
 *~
 .pydevproject
 .metadata
+
+# Environment variables (IMPORTANT)
+.env
+.env.*

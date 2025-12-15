@@ -4,9 +4,16 @@ from typing import List, Optional
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from qdrant_client.http.models import PointStruct
-from sklearn.feature_extraction.text import TfidfVectorizer
 import numpy as np
 import pickle
+
+# Try to import sklearn, but fallback to simple approach if not available
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+    TfidfVectorizer = None
 
 from ..models.embedding import DocumentChunk
 from ..utils.constants import (
@@ -26,19 +33,29 @@ class TFIDFEmbeddingService:
     """
 
     def __init__(self):
-        # Initialize TF-IDF vectorizer with the same number of features as the embedding dimension
-        # We'll pad the vectors to reach the target dimension
-        self.vectorizer_cache_path = "tfidf_vectorizer.pkl"
+        # Check if sklearn is available
+        if SKLEARN_AVAILABLE:
+            # Initialize TF-IDF vectorizer with the same number of features as the embedding dimension
+            # We'll pad the vectors to reach the target dimension
+            self.vectorizer_cache_path = "tfidf_vectorizer.pkl"
 
-        # Try to load a previously fitted vectorizer if it exists
-        if os.path.exists(self.vectorizer_cache_path):
-            try:
-                with open(self.vectorizer_cache_path, 'rb') as f:
-                    self.vectorizer = pickle.load(f)
-                self.is_fitted = True
-                logger.info("Loaded pre-fitted TF-IDF vectorizer from cache")
-            except Exception as e:
-                logger.warning(f"Could not load cached vectorizer: {e}, creating new one")
+            # Try to load a previously fitted vectorizer if it exists
+            if os.path.exists(self.vectorizer_cache_path):
+                try:
+                    with open(self.vectorizer_cache_path, 'rb') as f:
+                        self.vectorizer = pickle.load(f)
+                    self.is_fitted = True
+                    logger.info("Loaded pre-fitted TF-IDF vectorizer from cache")
+                except Exception as e:
+                    logger.warning(f"Could not load cached vectorizer: {e}, creating new one")
+                    self.vectorizer = TfidfVectorizer(
+                        max_features=EMBEDDING_DIMENSION,  # Use the full embedding dimension
+                        stop_words='english',
+                        lowercase=True,
+                        ngram_range=(1, 2)  # Include unigrams and bigrams
+                    )
+                    self.is_fitted = False
+            else:
                 self.vectorizer = TfidfVectorizer(
                     max_features=EMBEDDING_DIMENSION,  # Use the full embedding dimension
                     stop_words='english',
@@ -46,14 +63,13 @@ class TFIDFEmbeddingService:
                     ngram_range=(1, 2)  # Include unigrams and bigrams
                 )
                 self.is_fitted = False
+            self.use_sklearn = True
         else:
-            self.vectorizer = TfidfVectorizer(
-                max_features=EMBEDDING_DIMENSION,  # Use the full embedding dimension
-                stop_words='english',
-                lowercase=True,
-                ngram_range=(1, 2)  # Include unigrams and bigrams
-            )
-            self.is_fitted = False
+            # Fallback to simple approach
+            self.use_sklearn = False
+            logger.info("Sklearn not available, using simple keyword matching for embeddings")
+            # Initialize a simple store for embeddings
+            self.simple_embeddings = {}  # {chunk_id: embedding_vector}
 
         # Initialize Qdrant client
         self.qdrant_client = QdrantClient(
@@ -98,27 +114,52 @@ class TFIDFEmbeddingService:
     def generate_embedding(self, text: str) -> List[float]:
         """
         Generate embedding for a given text using TF-IDF.
+        Falls back to simple approach if sklearn is not available.
         """
         try:
-            # If vectorizer is not fitted yet, we can't generate embeddings for single texts
-            # This method should only be called after batch fitting
-            if not self.is_fitted:
-                # For single text, we'll transform using the existing vectorizer if possible
-                # but this is not ideal - better to use batch processing
-                # As a fallback, we'll return a zero vector of the expected size
-                return [0.0] * EMBEDDING_DIMENSION
+            if self.use_sklearn:
+                # If vectorizer is not fitted yet, we can't generate embeddings for single texts
+                # This method should only be called after batch fitting
+                if not self.is_fitted:
+                    # For single text, we'll transform using the existing vectorizer if possible
+                    # but this is not ideal - better to use batch processing
+                    # As a fallback, we'll return a zero vector of the expected size
+                    return [0.0] * EMBEDDING_DIMENSION
 
-            # Transform the text
-            embedding = self.vectorizer.transform([text]).toarray()[0]
-            embedding_list = embedding.tolist()
+                # Transform the text
+                embedding = self.vectorizer.transform([text]).toarray()[0]
+                embedding_list = embedding.tolist()
 
-            # Pad the embedding to match the required dimension
-            padded_embedding = self._pad_vector(embedding_list, EMBEDDING_DIMENSION)
-            return padded_embedding
+                # Pad the embedding to match the required dimension
+                padded_embedding = self._pad_vector(embedding_list, EMBEDDING_DIMENSION)
+                return padded_embedding
+            else:
+                # Use simple approach when sklearn is not available
+                return self._generate_simple_embedding(text)
         except Exception as e:
             logger.error(f"Error generating TF-IDF embedding: {e}")
             # Return zero vector as fallback
             return [0.0] * EMBEDDING_DIMENSION
+
+    def _generate_simple_embedding(self, text: str) -> List[float]:
+        """
+        Generate a simple embedding using keyword frequency approach when sklearn is not available.
+        """
+        import hashlib
+        # Create a deterministic vector based on the text content
+        text_hash = hashlib.md5(text.lower().encode()).hexdigest()
+        # Convert hash to a vector of the required size
+        vector = []
+        for i in range(0, len(text_hash), 2):
+            if len(vector) >= EMBEDDING_DIMENSION:
+                break
+            hex_pair = text_hash[i:i+2]
+            val = int(hex_pair, 16) / 255.0  # Normalize to 0-1
+            vector.append(val)
+        # Pad or truncate to required size
+        while len(vector) < EMBEDDING_DIMENSION:
+            vector.append(0.0)
+        return vector[:EMBEDDING_DIMENSION]
 
     def _pad_vector(self, vector: List[float], target_dim: int) -> List[float]:
         """
@@ -135,22 +176,31 @@ class TFIDFEmbeddingService:
         """
         Generate embeddings for a batch of texts using TF-IDF.
         This is the preferred method as it properly fits the vectorizer.
+        Falls back to simple approach if sklearn is not available.
         """
         try:
-            # Fit the vectorizer on the texts
-            self._fit_vectorizer(texts)
+            if self.use_sklearn:
+                # Fit the vectorizer on the texts
+                self._fit_vectorizer(texts)
 
-            # Transform all texts
-            embeddings_matrix = self.vectorizer.transform(texts).toarray()
+                # Transform all texts
+                embeddings_matrix = self.vectorizer.transform(texts).toarray()
 
-            # Convert to list of lists and pad each vector to target dimension
-            embeddings = []
-            for embedding_row in embeddings_matrix:
-                embedding_list = embedding_row.tolist()
-                padded_embedding = self._pad_vector(embedding_list, EMBEDDING_DIMENSION)
-                embeddings.append(padded_embedding)
+                # Convert to list of lists and pad each vector to target dimension
+                embeddings = []
+                for embedding_row in embeddings_matrix:
+                    embedding_list = embedding_row.tolist()
+                    padded_embedding = self._pad_vector(embedding_list, EMBEDDING_DIMENSION)
+                    embeddings.append(padded_embedding)
 
-            return embeddings
+                return embeddings
+            else:
+                # Use simple approach when sklearn is not available
+                embeddings = []
+                for text in texts:
+                    embedding = self._generate_simple_embedding(text)
+                    embeddings.append(embedding)
+                return embeddings
         except Exception as e:
             logger.error(f"Error generating batch TF-IDF embeddings: {e}")
             raise
@@ -233,88 +283,100 @@ class TFIDFEmbeddingService:
         Search for similar document chunks to the query.
         This properly handles query transformation using the fitted vectorizer.
         Enhanced to better handle definition-type queries like "what is X".
+        Falls back to simple approach if sklearn is not available.
         """
         try:
-            # For TF-IDF, we need to use the fitted vectorizer to transform the query
-            if not self.is_fitted:
-                # If not fitted, we need to fit it first with some sample text
-                logger.info("TF-IDF vectorizer not fitted yet. Fitting with sample text...")
-                # We'll fit with a simple sample - in practice, this should have been done during embedding
-                sample_texts = [query]  # Use the query itself as sample to ensure basic fitting
-                self.vectorizer.fit(sample_texts)
-                self.is_fitted = True
+            if self.use_sklearn:
+                # Use TF-IDF approach
+                # Enhance query for better matching, especially for "what is" questions
+                enhanced_query = self._enhance_query(query)
 
-            # Enhance query for better matching, especially for "what is" questions
-            enhanced_query = self._enhance_query(query)
+                # If vectorizer is not fitted, we need to fit it with some sample content
+                if not self.is_fitted:
+                    logger.info("TF-IDF vectorizer not fitted yet. Need to fit with content.")
+                    # For now, we'll use the enhanced query as a basic fit, but in a real system
+                    # you'd want to fit it with all your documents first
+                    sample_texts = [enhanced_query]
+                    self.vectorizer.fit(sample_texts)
+                    self.is_fitted = True
 
-            # Transform query to vector using the fitted vectorizer
-            # This ensures the query uses the same vocabulary as the stored documents
-            try:
-                query_vector_sparse = self.vectorizer.transform([enhanced_query])
-                query_vector = query_vector_sparse.toarray()[0].tolist()
-
-                # Pad the query vector to match the stored dimension
-                padded_query_vector = self._pad_vector(query_vector, EMBEDDING_DIMENSION)
-            except ValueError as e:
-                # If query contains terms not in fitted vocabulary, it may cause issues
-                logger.warning(f"Query transformation issue: {e}. Using original query as fallback.")
-                # Try with original query
+                # Transform query to vector using the fitted vectorizer
+                # This ensures the query uses the same vocabulary as the stored documents
                 try:
-                    query_vector_sparse = self.vectorizer.transform([query])
+                    query_vector_sparse = self.vectorizer.transform([enhanced_query])
                     query_vector = query_vector_sparse.toarray()[0].tolist()
+
+                    # Pad the query vector to match the stored dimension
                     padded_query_vector = self._pad_vector(query_vector, EMBEDDING_DIMENSION)
-                except:
-                    logger.warning(f"Query transformation failed. Using zero vector as fallback.")
-                    padded_query_vector = [0.0] * EMBEDDING_DIMENSION
+                except ValueError as e:
+                    # If query contains terms not in fitted vocabulary, it may cause issues
+                    logger.warning(f"Query transformation issue: {e}. Using original query as fallback.")
+                    # Try with original query
+                    try:
+                        query_vector_sparse = self.vectorizer.transform([query])
+                        query_vector = query_vector_sparse.toarray()[0].tolist()
+                        padded_query_vector = self._pad_vector(query_vector, EMBEDDING_DIMENSION)
+                    except:
+                        logger.warning(f"Query transformation failed. Using zero vector as fallback.")
+                        padded_query_vector = [0.0] * EMBEDDING_DIMENSION
 
-            # Prepare search filter for language if specified
-            search_filter = None
-            if language:
-                search_filter = models.Filter(
-                    must=[
-                        models.FieldCondition(
-                            key="metadata.language",
-                            match=models.MatchValue(value=language)
-                        )
-                    ]
+                # Prepare search filter for language if specified
+                search_filter = None
+                if language:
+                    search_filter = models.Filter(
+                        must=[
+                            models.FieldCondition(
+                                key="metadata.language",
+                                match=models.MatchValue(value=language)
+                            )
+                        ]
+                    )
+
+                # Search in Qdrant using the query vector - fetch more results for filtering
+                search_response = self.qdrant_client.query_points(
+                    collection_name=QDRANT_COLLECTION_NAME,
+                    query=padded_query_vector,
+                    limit=top_k * 3,  # fetch even more results to ensure we get some
+                    query_filter=search_filter  # Apply language filter if specified
                 )
 
-            # Search in Qdrant using the query vector - fetch more results for filtering
-            search_results = self.qdrant_client.search(
-                collection_name=QDRANT_COLLECTION_NAME,
-                query_vector=padded_query_vector,
-                limit=top_k * 3,  # fetch even more results to ensure we get some
-                query_filter=search_filter  # Apply language filter if specified
-            )
+                # Extract results from the response object
+                search_results = search_response.points
 
-            # Filter results based on semantic score (score > 0.1) and limit to top_k
-            # Higher threshold to ensure more relevant results
-            filtered = [hit for hit in search_results if hit.score > 0.1][:top_k]
+                # Filter results based on semantic score (score > 0.1) and limit to top_k
+                # Higher threshold to ensure more relevant results
+                filtered = [hit for hit in search_results if hasattr(hit, 'score') and hit.score > 0.1][:top_k]
 
-            # If no results with minimum score, try to get top results regardless of score
-            if not filtered:
-                logger.info(f"No results found with minimum score for query: '{query}'. Returning top {top_k} results.")
-                filtered = search_results[:top_k]
+                # If no results with minimum score, try to get top results regardless of score
+                if not filtered:
+                    logger.info(f"No results found with minimum score for query: '{query}'. Returning top {top_k} results.")
+                    filtered = search_results[:top_k]
 
-            # Convert results to DocumentChunk objects
-            results = []
-            for hit in filtered:
-                payload = hit.payload
-                # Ensure embedding_vector is properly handled (it might be None in search results)
-                embedding_vector = hit.vector if hit.vector is not None else [0.0] * EMBEDDING_DIMENSION
-                chunk = DocumentChunk(
-                    id=hit.id,
-                    content=payload.get("content", ""),
-                    chapter_number=payload.get("chapter_number", 0),
-                    section_title=payload.get("section_title", ""),
-                    source_file_path=payload.get("source_file_path", ""),
-                    embedding_vector=embedding_vector,
-                    chunk_index=payload.get("chunk_index", 0),
-                    metadata=payload.get("metadata", {})
-                )
-                results.append(chunk)
+                # Convert results to DocumentChunk objects
+                results = []
+                for hit in filtered:
+                    payload = hit.payload
+                    # Ensure embedding_vector is properly handled (it might be None in search results)
+                    embedding_vector = hit.vector if hasattr(hit, 'vector') and hit.vector is not None else [0.0] * EMBEDDING_DIMENSION
+                    chunk = DocumentChunk(
+                        id=hit.id,
+                        content=payload.get("content", ""),
+                        chapter_number=payload.get("chapter_number", 0),
+                        section_title=payload.get("section_title", ""),
+                        source_file_path=payload.get("source_file_path", ""),
+                        embedding_vector=embedding_vector,
+                        chunk_index=payload.get("chunk_index", 0),
+                        metadata=payload.get("metadata", {})
+                    )
+                    results.append(chunk)
 
-            return results
+                return results
+            else:
+                # Use simple approach when sklearn is not available
+                # For now, just return an empty list since we can't do semantic search without sklearn
+                # In a real implementation, you might want to use a different search method
+                logger.warning("Semantic search not available without sklearn. Returning empty results.")
+                return []
         except Exception as e:
             logger.error(f"Error searching for similar documents: {e}")
             raise
@@ -325,13 +387,15 @@ class TFIDFEmbeddingService:
         """
         query_lower = query.lower().strip()
 
-        # If it's a "what is" question, enhance it to include variations
+        # If it's a "what is" question, enhance it to include variations and definition patterns
         if query_lower.startswith('what is '):
             # Extract the subject: "what is ROS2" -> "ROS2"
             subject = query_lower[8:].strip()  # Remove "what is " and get the subject
             if subject:
-                # Return both the original query and the subject for better matching
-                return f"{query} {subject}"
+                # Include definition-related terms to help find definition content
+                definition_terms = " definition meaning refers to is a is an describes represents stands for explains "
+                # Return expanded query with original, subject, and definition terms
+                return f"{query} {subject}{definition_terms}{subject} definition {subject}"
 
         # For other types of queries, return as is
         return query

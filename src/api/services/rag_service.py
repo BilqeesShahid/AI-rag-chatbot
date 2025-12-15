@@ -6,6 +6,7 @@ import requests
 from ..models.query import QueryRequest, SourceChunk
 from ..services.retrieval_service import retrieval_service
 from ..services.chat_service import chat_service
+from ..services.hf_generation_service import hf_generation_service
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +15,7 @@ def summarize_answer(query: str, chunks: List[SourceChunk], retrieval_service) -
     """
     Summarize the answer based on the query and retrieved chunks.
     Generic function that works across all book content using comprehensive semantic relevance.
+    Enhanced to better handle definition-type queries like "what is X".
     """
     # Get content from all chunks and filter out non-relevant content
     valid_contents = []
@@ -34,6 +36,9 @@ def summarize_answer(query: str, chunks: List[SourceChunk], retrieval_service) -
     # Comprehensive relevance scoring
     query_lower = query.lower().strip()
     query_words = set(word for word in query_lower.split() if len(word) > 2)
+
+    # Check if it's a definition query to apply special logic
+    is_definition_query = 'what is' in query_lower or 'define' in query_lower or 'meaning of' in query_lower
 
     scored_results = []
     for chunk, content in valid_contents:
@@ -59,13 +64,17 @@ def summarize_answer(query: str, chunks: List[SourceChunk], retrieval_service) -
                     score += phrase_matches * len(phrase)  # Longer phrases get higher weight
 
         # 3. Semantic pattern matching for different query types
-        if 'what is' in query_lower or query_lower.startswith('what is '):
-            # Prioritize definition patterns for "what is" questions
+        if is_definition_query:
+            # Prioritize definition patterns for definition questions
             definition_patterns = [' is a ', ' is an ', ' refers to ', ' means ', ' stands for ',
-                                 ' defined as ', ' known as ', ' describes ', ' represents ']
+                                 ' defined as ', ' known as ', ' describes ', ' represents ', ' called ', ' termed ']
             for pattern in definition_patterns:
                 if pattern in content_lower:
-                    score += 15  # Strong boost for definition patterns
+                    score += 20  # Strong boost for definition patterns
+
+            # Additional boost for short, clear definitions
+            if 10 <= len(content.split()) <= 100 and (' is ' in content_lower or ' are ' in content_lower):
+                score += 15
 
         elif any(qw in query_lower for qw in ['how to', 'how do', 'steps', 'process', 'procedure']):
             # Prioritize procedural content for "how" questions
@@ -94,11 +103,17 @@ def summarize_answer(query: str, chunks: List[SourceChunk], retrieval_service) -
 
         # 5. Subject relevance - check if main subject appears multiple times
         if len(query_words) > 0:
-            main_subject = list(query_words)[0] if query_words else ""
-            if main_subject and len(main_subject) > 3:  # Only consider meaningful subjects
-                subject_frequency = content_lower.count(main_subject)
+            # Extract main subject for "what is X" queries
+            main_subject = ""
+            if 'what is ' in query_lower:
+                main_subject = query_lower.split('what is ')[1].strip().split()[0] if len(query_lower.split('what is ')) > 1 else ""
+            elif query_words:
+                main_subject = list(query_words)[0]
+
+            if main_subject and len(main_subject) > 2:  # Only consider meaningful subjects
+                subject_frequency = content_lower.count(main_subject.lower())
                 if subject_frequency > 0:
-                    score += subject_frequency * 3  # Boost based on subject relevance
+                    score += subject_frequency * 5  # Higher boost for subject relevance in definition queries
 
         # 6. Chapter-topic relevance
         chunk_title_lower = chunk.section_title.lower()
@@ -290,33 +305,154 @@ class RAGService:
 
     async def _generate_response_with_hf(self, query: str, source_chunks: List[SourceChunk]) -> str:
         """
-        Generate a response using the retrieved context with priority to first chapters.
-        Prioritizes content from early chapters (like Chapter 0, 1, etc.) before others.
+        Generate a response using Hugging Face models with the retrieved context.
+        Enhanced to better handle definition queries like "what is X".
         """
         try:
-            # Use the summarization function to create a concise answer
-            summary = summarize_answer(query, source_chunks, self.retrieval_service)
+            # Check if it's a definition query to apply special logic
+            query_lower = query.lower().strip()
+            is_definition_query = any(phrase in query_lower for phrase in ['what is', 'define', 'meaning of', 'what does ... mean'])
 
-            # If we have source chunks, we can provide more detailed information
-            if source_chunks and "No relevant content found" not in summary and "couldn't find relevant information" not in summary:
-                return summary
-            else:
-                # If no relevant content was found, try to be more specific about why
-                if not source_chunks:
-                    return f"I couldn't find any relevant information in the book to answer '{query}'. The search returned no results. Please try rephrasing your question."
-                else:
-                    return f"I couldn't find relevant information in the book to answer '{query}'. The retrieved content didn't match your query well. Please try rephrasing your question."
-        except Exception as e:
-            logger.error(f"Error generating response: {e}")
-            # Fallback response
             if source_chunks:
-                # If we found chunks but had an error, at least mention that
-                # Sort by chapter to prioritize early chapters in message
-                sorted_chunks = sorted(source_chunks, key=lambda x: x.chapter_number)
-                if sorted_chunks:
-                    first_chunk = sorted_chunks[0]
-                    return f"I found relevant information in Chapter {first_chunk.chapter_number}, Section '{first_chunk.section_title}' about '{query}', but encountered an issue compiling the full response. Please try asking your question again."
-            return f"I couldn't find relevant information in the book to answer '{query}'. Please try rephrasing your question."
+                # If it's a definition query, prioritize chunks that might contain definitions
+                if is_definition_query:
+                    # Re-rank chunks based on definition patterns before passing to generation
+                    ranked_chunks = self._rank_chunks_for_definitions(query, source_chunks)
+
+                    # Check if the top-ranked chunk contains a clear definition
+                    if ranked_chunks:
+                        top_chunk = ranked_chunks[0]
+                        top_chunk_content = self.retrieval_service.get_chunk_content(top_chunk.chunk_id)
+
+                        # If the top chunk contains a clear definition pattern, return it directly
+                        if top_chunk_content and self._contains_clear_definition(query, top_chunk_content):
+                            return f"Based on the book content: {top_chunk_content[:500]}..."
+
+                    response = hf_generation_service.generate_response(query, ranked_chunks, self.retrieval_service)
+                else:
+                    response = hf_generation_service.generate_response(query, source_chunks, self.retrieval_service)
+                return response
+            else:
+                return f"I couldn't find any relevant information in the book to answer '{query}'. The search returned no results. Please try rephrasing your question."
+        except Exception as e:
+            logger.error(f"Error generating response with Hugging Face: {e}")
+            # Fallback to local summarization
+            try:
+                summary = summarize_answer(query, source_chunks, self.retrieval_service)
+                return summary
+            except:
+                # Final fallback
+                if source_chunks:
+                    # Just return the content of the first chunk
+                    first_chunk_content = self.retrieval_service.get_chunk_content(source_chunks[0].chunk_id)
+                    if first_chunk_content:
+                        return f"Based on the book content: {first_chunk_content[:500]}..."
+                return f"I couldn't find relevant information in the book to answer '{query}'. Please try rephrasing your question."
+
+    def _contains_clear_definition(self, query: str, content: str) -> bool:
+        """
+        Check if the content contains a clear definition for the query subject.
+        """
+        query_lower = query.lower().strip()
+
+        # Extract the subject from "what is X" queries
+        if 'what is ' in query_lower:
+            subject = query_lower.split('what is ')[1].strip().split()[0] if len(query_lower.split('what is ')) > 1 else ""
+            if subject and len(subject) > 2:  # Only consider meaningful subjects
+                content_lower = content.lower()
+
+                # Look for definition patterns with the subject
+                definition_patterns = [
+                    f"{subject} (is|was|are) ",
+                    f"{subject} (is|was|are) a ",
+                    f"{subject} (is|was|are) an ",
+                    f"{subject} (stands|stands) for ",
+                    f"{subject} (means|mean) ",
+                    f"{subject} (refers|refer) to "
+                ]
+
+                import re
+                for pattern in definition_patterns:
+                    if re.search(pattern.replace('(', '(?:'), content_lower):
+                        return True
+
+                # Look for the subject followed by "is" pattern
+                subject_is_pattern = rf"\b{re.escape(subject.lower())}\b.*\bis\b"
+                if re.search(subject_is_pattern, content_lower):
+                    # Check if what follows "is" is a reasonable definition
+                    match = re.search(rf"\b{re.escape(subject.lower())}\b(.*)", content_lower)
+                    if match:
+                        after_subject = match.group(1)
+                        # If it's followed by "is" and some descriptive text
+                        if ' is ' in after_subject and len(after_subject.split()) < 50:  # Reasonable length for a definition
+                            return True
+
+        return False
+
+    def _rank_chunks_for_definitions(self, query: str, source_chunks: List[SourceChunk]) -> List[SourceChunk]:
+        """
+        Re-rank chunks to prioritize those that might contain definitions for definition queries.
+        Enhanced to look for specific definition patterns and prioritize exact definitions.
+        """
+        # Get content for each chunk to score it
+        scored_chunks = []
+        query_lower = query.lower().strip()
+
+        for chunk in source_chunks:
+            content = self.retrieval_service.get_chunk_content(chunk.chunk_id)
+            if content:
+                content_lower = content.lower()
+                score = 0
+
+                # Look for the exact definition pattern of ROS2 or similar
+                # Check if this looks like a definition of the subject being asked about
+                if 'what is ' in query_lower:
+                    subject = query_lower.split('what is ')[1].strip().split()[0] if len(query_lower.split('what is ')) > 1 else ""
+                    if subject:
+                        # Look for exact definition patterns with the subject
+                        # e.g., "ROS2 is a flexible framework" or "X is Y" patterns
+                        subject_pattern = f"{subject.lower()} is "
+                        if subject_pattern in content_lower:
+                            score += 50  # High score for exact subject definition pattern
+
+                        # Look for the specific pattern from the docs: "X (Full Name) is a ..."
+                        import re
+                        # Check for pattern like "ROS2 (Robot Operating System 2) is a ..."
+                        if re.search(rf"{re.escape(subject.lower())} \([^)]+\) is (a|an) ", content_lower):
+                            score += 60  # Very high score for formal definition pattern
+
+                # Boost score if content contains definition patterns
+                if any(pattern in content_lower for pattern in [' is a ', ' is an ', ' refers to ', ' means ', ' stands for ', ' defined as ', ' known as ', ' describes ', ' represents ', ' called ', ' termed ']):
+                    score += 20
+                elif ' is ' in content_lower and 10 <= len(content.split()) <= 100:  # Short, likely definition
+                    score += 15
+                elif 'definition' in content_lower:
+                    score += 18
+
+                # Boost if main subject appears in content
+                if 'what is ' in query_lower:
+                    subject = query_lower.split('what is ')[1].strip().split()[0] if len(query_lower.split('what is ')) > 1 else ""
+                    if subject and len(subject) > 2:
+                        if subject.lower() in content_lower:
+                            score += 10
+
+                # Penalize procedural content for definition queries
+                if any(word in content_lower for word in ['first', 'then', 'next', 'finally', 'step', 'process', 'how to', 'method', 'exercise', 'goal:', 'steps:', 'instructions:']):
+                    score -= 15
+
+                # Additional boost for content that appears to be introductory or foundational
+                if any(word in content_lower for word in ['introduction', 'what is', 'overview', 'fundamentals', 'basic']):
+                    score += 12
+
+                scored_chunks.append((chunk, score))
+            else:
+                scored_chunks.append((chunk, 0))  # Default score for chunks without content
+
+        # Sort by score in descending order
+        scored_chunks.sort(key=lambda x: x[1], reverse=True)
+
+        # Return just the chunks in the new order
+        return [chunk for chunk, score in scored_chunks]
 
 
 # Singleton instance

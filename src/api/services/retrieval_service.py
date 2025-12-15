@@ -3,7 +3,7 @@ from typing import List, Optional
 from ..models.embedding import DocumentChunk
 from ..models.query import SourceChunk
 from ..models.query import QueryRequest
-from ..services.tfidf_embedding_service import tfidf_embedding_service
+from ..services.hf_embedding_service import hf_embedding_service
 from ..utils.helpers import calculate_similarity_score
 
 logger = logging.getLogger(__name__)
@@ -29,11 +29,11 @@ def reformulate_query(query: str) -> str:
 class RetrievalService:
     """
     Service for retrieving relevant document chunks based on queries.
-    Handles both general queries and selected text prioritization.
+    Uses Hugging Face sentence transformers for semantic similarity.
     """
 
     def __init__(self):
-        self.embedding_service = tfidf_embedding_service
+        self.embedding_service = hf_embedding_service
 
     def retrieve_chunks(self, query: str, top_k: int = 5, language: Optional[str] = None) -> List[SourceChunk]:
         """
@@ -193,21 +193,31 @@ class RetrievalService:
 
                     # Boost score if content contains definition patterns
                     if ' is a ' in content_lower or ' is an ' in content_lower:
-                        score += 10  # Strong definition pattern
-                    elif ' is ' in content_lower and len(content_lower.split()) < 100:  # Short definition
-                        score += 5
+                        score += 25  # Strong definition pattern
+                    elif ' is ' in content_lower and 10 <= len(content_lower.split()) <= 100:  # Short definition
+                        score += 15  # Strong definition pattern
                     elif 'definition' in content_lower:
-                        score += 8
-                    elif 'means' in content_lower or 'stands for' in content_lower:
-                        score += 7
+                        score += 20
+                    elif 'means' in content_lower or 'stands for' in content_lower or 'refers to' in content_lower:
+                        score += 18
+                    elif 'describes' in content_lower or 'represents' in content_lower or 'indicates' in content_lower:
+                        score += 15
+
+                    # Additional boost for definition patterns
+                    if any(pattern in content_lower for pattern in [' known as ', ' called ', ' termed ', ' named ']):
+                        score += 12
 
                     # Boost if the subject being defined appears in the content
-                    if subject and subject in content_lower:
-                        score += 3
+                    if subject and subject.lower() in content_lower:
+                        score += 10  # Higher boost for subject match
 
                     # Boost if section title matches the query subject
-                    if subject and subject in chunk.section_title.lower():
-                        score += 2
+                    if subject and subject.lower() in chunk.section_title.lower():
+                        score += 5
+
+                    # Penalize if content is clearly not a definition (e.g., contains procedural language)
+                    if any(word in content_lower for word in ['first', 'then', 'next', 'finally', 'step', 'process', 'how to']):
+                        score -= 10  # Reduce score for procedural content
 
                     scored_chunks.append((chunk, score))
 

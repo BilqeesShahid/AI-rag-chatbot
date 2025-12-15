@@ -155,11 +155,14 @@ class EmbeddingService:
             query_embedding = self.generate_embedding(query)
 
             # Search in Qdrant
-            search_results = self.qdrant_client.search(
+            search_response = self.qdrant_client.query_points(
                 collection_name=QDRANT_COLLECTION_NAME,
-                query_vector=query_embedding,
+                query=query_embedding,
                 limit=top_k
             )
+
+            # Extract results from the response object
+            search_results = search_response.points
 
             # Convert results to DocumentChunk objects
             results = []
@@ -171,7 +174,7 @@ class EmbeddingService:
                     chapter_number=payload.get("chapter_number", 0),
                     section_title=payload.get("section_title", ""),
                     source_file_path=payload.get("source_file_path", ""),
-                    embedding_vector=hit.vector,
+                    embedding_vector=hit.vector if hasattr(hit, 'vector') and hit.vector is not None else [0.0] * EMBEDDING_DIMENSION,
                     chunk_index=payload.get("chunk_index", 0),
                     metadata=payload.get("metadata", {})
                 )

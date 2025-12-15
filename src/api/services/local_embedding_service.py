@@ -1,233 +1,235 @@
 import logging
 from typing import List, Optional
-from qdrant_client import QdrantClient
-from qdrant_client.http import models
-from qdrant_client.http.models import PointStruct
-from sentence_transformers import SentenceTransformer
+import os
+import pickle
 import numpy as np
 
+# Try to import sklearn, but fallback to simple approach if not available
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+    TfidfVectorizer = None
+    cosine_similarity = None
+
 from ..models.embedding import DocumentChunk
-from ..utils.constants import (
-    QDRANT_URL,
-    QDRANT_API_KEY,
-    QDRANT_COLLECTION_NAME,
-    EMBEDDING_DIMENSION
-)
+from ..utils.constants import EMBEDDING_DIMENSION
 
 logger = logging.getLogger(__name__)
 
 
 class LocalEmbeddingService:
     """
-    Service for generating and storing embeddings using local sentence transformers.
-    This avoids quota limits from external APIs.
+    Service for generating and storing embeddings locally without external dependencies.
+    Uses TF-IDF for keyword-based similarity and stores embeddings in memory/file.
     """
 
     def __init__(self):
-        # Initialize local sentence transformer model
-        self.model = SentenceTransformer('all-MiniLM-L6-v2')  # Lightweight model
-
-        # Initialize Qdrant client
-        self.qdrant_client = QdrantClient(
-            url=QDRANT_URL,
-            api_key=QDRANT_API_KEY,
-            prefer_grpc=False  # Using HTTP for better compatibility
-        )
-
-        # Ensure collection exists
-        self._ensure_collection_exists()
-
-    def _ensure_collection_exists(self):
-        """
-        Ensure the Qdrant collection exists with the correct configuration.
-        """
-        try:
-            # Try to get collection info to see if it exists
-            self.qdrant_client.get_collection(QDRANT_COLLECTION_NAME)
-            logger.info(f"Collection {QDRANT_COLLECTION_NAME} already exists")
-        except:
-            # Create collection if it doesn't exist
-            self.qdrant_client.create_collection(
-                collection_name=QDRANT_COLLECTION_NAME,
-                vectors_config=models.VectorParams(
-                    size=384,  # all-MiniLM-L6-v2 produces 384-dimensional vectors
-                    distance=models.Distance.COSINE
-                )
+        # Check if sklearn is available
+        if SKLEARN_AVAILABLE:
+            # Initialize TF-IDF vectorizer for keyword-based similarity
+            self.vectorizer = TfidfVectorizer(
+                stop_words='english',
+                lowercase=True,
+                ngram_range=(1, 2),  # Include unigrams and bigrams
+                max_features=EMBEDDING_DIMENSION  # Use the configured embedding dimension
             )
-            logger.info(f"Created collection {QDRANT_COLLECTION_NAME}")
+            self.use_sklearn = True
+        else:
+            # Fallback to simple approach
+            self.use_sklearn = False
+            logger.info("Sklearn not available, using simple keyword matching")
 
-    def generate_embedding(self, text: str) -> List[float]:
-        """
-        Generate embedding for a given text using local sentence transformer.
-        """
-        try:
-            # Generate embedding using local model
-            embedding = self.model.encode([text])[0].tolist()
-            return embedding
-        except Exception as e:
-            logger.error(f"Error generating local embedding: {e}")
-            raise
+        # Store all document contents with their IDs for TF-IDF processing
+        self.chunk_store = {}  # {chunk_id: DocumentChunk}
+        self.all_contents = []  # List of all document contents
+        self.content_to_id = {}  # {content_index: chunk_id}
 
-    def generate_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
-        """
-        Generate embeddings for a batch of texts.
-        """
+        # Try to load any previously stored data
+        self.load_embeddings_from_file()
+
+    def save_embeddings_to_file(self):
+        """Save embeddings to a local file for persistence."""
         try:
-            embeddings = self.model.encode(texts).tolist()
-            return embeddings
+            data = {
+                'chunks': self.chunk_store,
+                'all_contents': self.all_contents,
+                'content_to_id': self.content_to_id
+            }
+            with open('local_embeddings.pkl', 'wb') as f:
+                pickle.dump(data, f)
         except Exception as e:
-            logger.error(f"Error generating batch embeddings: {e}")
-            raise
+            logger.warning(f"Could not save embeddings to file: {e}")
+
+    def load_embeddings_from_file(self):
+        """Load embeddings from a local file."""
+        try:
+            if os.path.exists('local_embeddings.pkl'):
+                with open('local_embeddings.pkl', 'rb') as f:
+                    data = pickle.load(f)
+                    self.chunk_store = data.get('chunks', {})
+                    self.all_contents = data.get('all_contents', [])
+                    self.content_to_id = data.get('content_to_id', {})
+        except Exception as e:
+            logger.warning(f"Could not load embeddings from file: {e}")
 
     def store_embedding(self, document_chunk: DocumentChunk) -> str:
         """
-        Store a document chunk with its embedding in Qdrant.
+        Store a document chunk with its TF-IDF representation locally.
         """
         try:
-            # Generate embedding using local model
-            embedding_vector = self.generate_embedding(document_chunk.content)
+            # Store the chunk
+            self.chunk_store[document_chunk.id] = document_chunk
 
-            # Prepare the point for Qdrant
-            point = PointStruct(
-                id=document_chunk.id,
-                vector=embedding_vector,
-                payload={
-                    "content": document_chunk.content,
-                    "chapter_number": document_chunk.chapter_number,
-                    "section_title": document_chunk.section_title,
-                    "source_file_path": document_chunk.source_file_path,
-                    "chunk_index": document_chunk.chunk_index,
-                    "metadata": document_chunk.metadata or {}
-                }
-            )
+            # Add content to the list for TF-IDF processing
+            content_index = len(self.all_contents)
+            self.all_contents.append(document_chunk.content)
+            self.content_to_id[content_index] = document_chunk.id
 
-            # Store in Qdrant
-            self.qdrant_client.upsert(
-                collection_name=QDRANT_COLLECTION_NAME,
-                points=[point]
-            )
+            # Re-fit the vectorizer with all contents to maintain vocabulary consistency (if sklearn is available)
+            if self.use_sklearn and len(self.all_contents) > 0:
+                try:
+                    self.vectorizer.fit(self.all_contents)
+                except:
+                    # If there's an issue with fitting, continue anyway
+                    pass
+
+            # Save to file for persistence
+            self.save_embeddings_to_file()
 
             return document_chunk.id
         except Exception as e:
             logger.error(f"Error storing embedding: {e}")
             raise
 
-    def store_embeddings_batch(self, document_chunks: List[DocumentChunk]) -> List[str]:
+    def search_similar(self, query: str, top_k: int = 5, language: Optional[str] = None) -> List[DocumentChunk]:
         """
-        Store multiple document chunks with their embeddings in Qdrant.
-        """
-        try:
-            # Extract content from all chunks
-            texts = [chunk.content for chunk in document_chunks]
-
-            # Generate embeddings in batch for efficiency
-            embedding_vectors = self.generate_embeddings_batch(texts)
-
-            point_structs = []
-            for i, chunk in enumerate(document_chunks):
-                point = PointStruct(
-                    id=chunk.id,
-                    vector=embedding_vectors[i],
-                    payload={
-                        "content": chunk.content,
-                        "chapter_number": chunk.chapter_number,
-                        "section_title": chunk.section_title,
-                        "source_file_path": chunk.source_file_path,
-                        "chunk_index": chunk.chunk_index,
-                        "metadata": chunk.metadata or {}
-                    }
-                )
-                point_structs.append(point)
-
-            # Store all points in Qdrant
-            self.qdrant_client.upsert(
-                collection_name=QDRANT_COLLECTION_NAME,
-                points=point_structs
-            )
-
-            return [chunk.id for chunk in document_chunks]
-        except Exception as e:
-            logger.error(f"Error storing embeddings batch: {e}")
-            raise
-
-    def search_similar(self, query: str, top_k: int = 5) -> List[DocumentChunk]:
-        """
-        Search for similar document chunks to the query.
+        Search for similar document chunks to the query using TF-IDF similarity.
+        Falls back to simple keyword matching if sklearn is not available.
         """
         try:
-            # Generate embedding for the query using local model
-            query_embedding = self.generate_embedding(query)
+            if not self.all_contents:
+                logger.warning("No contents in store, returning empty results")
+                return []
 
-            # Search in Qdrant
-            search_results = self.qdrant_client.search(
-                collection_name=QDRANT_COLLECTION_NAME,
-                query_vector=query_embedding,
-                limit=top_k
-            )
+            if self.use_sklearn:
+                # Use TF-IDF approach
+                try:
+                    # Fit the vectorizer with all contents first
+                    self.vectorizer.fit(self.all_contents)
 
-            # Convert results to DocumentChunk objects
-            results = []
-            for hit in search_results:
-                payload = hit.payload
-                chunk = DocumentChunk(
-                    id=hit.id,
-                    content=payload.get("content", ""),
-                    chapter_number=payload.get("chapter_number", 0),
-                    section_title=payload.get("section_title", ""),
-                    source_file_path=payload.get("source_file_path", ""),
-                    embedding_vector=hit.vector,
-                    chunk_index=payload.get("chunk_index", 0),
-                    metadata=payload.get("metadata", {})
-                )
-                results.append(chunk)
+                    # Transform all contents and the query
+                    all_vectors = self.vectorizer.transform(self.all_contents)
+                    query_vector = self.vectorizer.transform([query])
 
-            return results
+                    # Calculate similarities
+                    similarities = cosine_similarity(query_vector, all_vectors)[0]
+
+                    # Create results list
+                    results = []
+                    # Create a list of (index, similarity) pairs
+                    indexed_similarities = list(enumerate(similarities))
+                    # Sort by similarity (highest first)
+                    indexed_similarities.sort(key=lambda x: x[1], reverse=True)
+
+                    # Get top-k results
+                    top_results = indexed_similarities[:top_k]
+
+                    for content_index, similarity in top_results:
+                        chunk_id = self.content_to_id.get(content_index)
+                        if chunk_id and chunk_id in self.chunk_store:
+                            chunk = self.chunk_store[chunk_id]
+                            results.append(chunk)
+
+                    return results
+                except Exception as e:
+                    logger.warning(f"TF-IDF approach failed: {e}, falling back to simple matching")
+                    return self._simple_keyword_search(query, top_k)
+            else:
+                # Use simple keyword matching
+                return self._simple_keyword_search(query, top_k)
         except Exception as e:
             logger.error(f"Error searching for similar documents: {e}")
-            raise
+            return []
 
-    def delete_embedding(self, chunk_id: str):
+    def _simple_keyword_search(self, query: str, top_k: int) -> List[DocumentChunk]:
         """
-        Delete an embedding from Qdrant by ID.
+        Simple keyword-based search as a fallback when sklearn is not available.
         """
-        try:
-            self.qdrant_client.delete(
-                collection_name=QDRANT_COLLECTION_NAME,
-                points_selector=models.PointIdsList(
-                    points=[chunk_id]
-                )
-            )
-        except Exception as e:
-            logger.error(f"Error deleting embedding: {e}")
-            raise
+        results = []
+        query_lower = query.lower()
+        query_words = set(query_lower.split())
+
+        # Calculate similarity scores based on keyword overlap
+        scored_chunks = []
+        for content_index, content in enumerate(self.all_contents):
+            chunk_id = self.content_to_id.get(content_index)
+            if chunk_id and chunk_id in self.chunk_store:
+                content_lower = content.lower()
+                content_words = set(content_lower.split())
+
+                # Calculate overlap score
+                overlap = len(query_words.intersection(content_words))
+                total_words = len(query_words.union(content_words))
+
+                if total_words > 0:
+                    score = overlap / total_words
+                else:
+                    score = 0
+
+                # Also add bonus for exact phrase matches
+                if query_lower in content_lower:
+                    score += 0.5  # Boost for exact phrase matches
+
+                scored_chunks.append((self.chunk_store[chunk_id], score))
+
+        # Sort by score in descending order
+        scored_chunks.sort(key=lambda x: x[1], reverse=True)
+
+        # Return top-k results
+        return [chunk for chunk, score in scored_chunks[:top_k]]
 
     def get_embedding(self, chunk_id: str) -> Optional[DocumentChunk]:
         """
         Retrieve a document chunk by its ID.
         """
         try:
-            records = self.qdrant_client.retrieve(
-                collection_name=QDRANT_COLLECTION_NAME,
-                ids=[chunk_id]
-            )
-
-            if records:
-                record = records[0]
-                payload = record.payload
-                return DocumentChunk(
-                    id=record.id,
-                    content=payload.get("content", ""),
-                    chapter_number=payload.get("chapter_number", 0),
-                    section_title=payload.get("section_title", ""),
-                    source_file_path=payload.get("source_file_path", ""),
-                    embedding_vector=record.vector,
-                    chunk_index=payload.get("chunk_index", 0),
-                    metadata=payload.get("metadata", {})
-                )
-            return None
+            return self.chunk_store.get(chunk_id)
         except Exception as e:
             logger.error(f"Error retrieving embedding: {e}")
-            raise
+            return None
+
+    def delete_embedding(self, chunk_id: str):
+        """
+        Delete an embedding by ID.
+        """
+        try:
+            if chunk_id in self.chunk_store:
+                # Find and remove the content from all_contents
+                chunk = self.chunk_store[chunk_id]
+                content_to_remove = chunk.content
+                if content_to_remove in self.all_contents:
+                    index_to_remove = self.all_contents.index(content_to_remove)
+                    self.all_contents.pop(index_to_remove)
+                    # Update content_to_id mapping
+                    updated_content_to_id = {}
+                    for idx, original_idx in self.content_to_id.items():
+                        if original_idx != chunk_id:
+                            if idx > index_to_remove:
+                                new_idx = idx - 1
+                            else:
+                                new_idx = idx
+                            updated_content_to_id[new_idx] = original_idx
+                    self.content_to_id = updated_content_to_id
+
+                del self.chunk_store[chunk_id]
+
+            # Save updated embeddings
+            self.save_embeddings_to_file()
+        except Exception as e:
+            logger.error(f"Error deleting embedding: {e}")
 
 
 # Singleton instance
